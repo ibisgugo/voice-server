@@ -10,7 +10,6 @@ app.get('/', (_req, res) => {
   res.status(200).send('voice-server alive');
 });
 
-// Twilio will request this URL via HTTP and receive TwiML instructing it to open a bidirectional media stream.
 app.post('/twiml', (_req, res) => {
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || _req.get('host');
 
@@ -24,7 +23,7 @@ app.post('/twiml', (_req, res) => {
 </Response>`;
 
   res.type('text/xml').send(twiml);
-});;
+});
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/media-stream' });
@@ -36,12 +35,11 @@ wss.on('connection', (ws) => {
     try {
       const data = JSON.parse(message);
 
-      // For now we only log stream lifecycle events.
-      // We are NOT sending media back yet; that comes in the next phase.
       if (data.event === 'start') {
         console.log('Stream started:', data.start?.streamSid);
       } else if (data.event === 'media') {
-        // Audio frames arrive here from Twilio.
+        // We are receiving audio from Twilio here.
+        // Next phase will transform and send audio back.
       } else if (data.event === 'stop') {
         console.log('Stream stopped');
       }
