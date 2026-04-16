@@ -2,160 +2,150 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const axios = require('axios');
-
-process.on('uncaughtException', (err) => {
-  console.error('UNCAUGHT EXCEPTION:', err);
-});
-
-process.on('unhandledRejection', (err) => {
-  console.error('UNHANDLED REJECTION:', err);
-});
-
-console.log('Booting voice-server...');
+const FormData = require('form-data');
 
 const app = express();
-app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
 
-const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY || '';
-const VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '';
-
-console.log('ELEVENLABS_API_KEY present:', !!ELEVEN_API_KEY);
-console.log('ELEVENLABS_VOICE_ID present:', !!VOICE_ID);
+const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
+const VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
+const CHUNK_MS = 1500; // puedes bajar a 1200 luego
 
 app.get('/', (_req, res) => {
-  res.status(200).send('voice-server alive');
+  res.send('voice-server live');
 });
 
 app.post('/twiml', (_req, res) => {
-  const host = process.env.RENDER_EXTERNAL_HOSTNAME || _req.get('host');
+  const host = process.env.RENDER_EXTERNAL_HOSTNAME;
 
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+  res.type('text/xml').send(`
 <Response>
   <Say>Connecting you now.</Say>
-  <Pause length="1"/>
   <Connect>
     <Stream url="wss://${host}/media-stream" />
   </Connect>
-</Response>`;
-
-  res.type('text/xml').send(twiml);
+</Response>
+`);
 });
 
-async function elevenTtsToUlawBase64(text) {
-  if (!ELEVEN_API_KEY) {
-    throw new Error('Missing ELEVENLABS_API_KEY');
-  }
-  if (!VOICE_ID) {
-    throw new Error('Missing ELEVENLABS_VOICE_ID');
-  }
+// ===== AUDIO HELPERS =====
+function muLawDecode(byte) {
+  byte = ~byte & 0xff;
+  let sign = byte & 0x80;
+  let exponent = (byte >> 4) & 0x07;
+  let mantissa = byte & 0x0f;
+  let sample = ((mantissa << 4) + 8) << exponent;
+  sample -= 132;
+  return sign ? -sample : sample;
+}
 
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}?output_format=ulaw_8000&optimize_streaming_latency=3`;
+function mulawToPCM(buffer) {
+  const out = Buffer.alloc(buffer.length * 2);
+  for (let i = 0; i < buffer.length; i++) {
+    out.writeInt16LE(muLawDecode(buffer[i]), i * 2);
+  }
+  return out;
+}
 
-  console.log('Calling ElevenLabs TTS...');
+function pcmToWav(pcm) {
+  const header = Buffer.alloc(44);
+
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(8000, 24);
+  header.writeUInt32LE(8000 * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(pcm.length, 40);
+
+  return Buffer.concat([header, pcm]);
+}
+
+// ===== ELEVENLABS =====
+async function transformAudio(wavBuffer) {
+  const form = new FormData();
+
+  form.append('audio', wavBuffer, {
+    filename: 'audio.wav',
+    contentType: 'audio/wav'
+  });
 
   const response = await axios.post(
-    url,
-    {
-      text,
-      model_id: 'eleven_multilingual_v2',
-      voice_settings: {
-        stability: 0.45,
-        similarity_boost: 0.8,
-        style: 0.1,
-        use_speaker_boost: true
-      }
-    },
+    `https://api.elevenlabs.io/v1/speech-to-speech/${VOICE_ID}?output_format=ulaw_8000`,
+    form,
     {
       headers: {
+        ...form.getHeaders(),
         'xi-api-key': ELEVEN_API_KEY,
-        'Content-Type': 'application/json',
-        'Accept': 'audio/basic'
+        Accept: 'audio/basic'
       },
-      responseType: 'arraybuffer',
-      timeout: 30000
+      responseType: 'arraybuffer'
     }
   );
-
-  console.log('ElevenLabs TTS success, bytes:', response.data?.byteLength || 0);
 
   return Buffer.from(response.data).toString('base64');
 }
 
-async function speakOnCall(ws, streamSid, text, markName) {
-  const payload = await elevenTtsToUlawBase64(text);
-
-  ws.send(JSON.stringify({
-    event: 'media',
-    streamSid,
-    media: {
-      payload
-    }
-  }));
-
-  ws.send(JSON.stringify({
-    event: 'mark',
-    streamSid,
-    mark: {
-      name: markName
-    }
-  }));
-}
-
+// ===== SERVER =====
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/media-stream' });
 
 wss.on('connection', (ws) => {
-  console.log('Twilio media stream connected');
+  let streamSid;
+  let buffer = [];
+  let processing = false;
 
-  let streamSid = null;
-  let greeted = false;
+  setInterval(async () => {
+    if (!streamSid || processing || buffer.length === 0) return;
 
-  ws.on('message', async (message) => {
+    processing = true;
+
+    const audio = Buffer.concat(buffer);
+    buffer = [];
+
     try {
-      const data = JSON.parse(message);
+      const pcm = mulawToPCM(audio);
+      const wav = pcmToWav(pcm);
 
-      if (data.event === 'start') {
-        streamSid = data.start?.streamSid;
-        console.log('Stream started:', streamSid);
+      const transformed = await transformAudio(wav);
 
-        if (!greeted && streamSid) {
-          greeted = true;
+      ws.send(JSON.stringify({
+        event: 'media',
+        streamSid,
+        media: { payload: transformed }
+      }));
 
-          try {
-            await speakOnCall(
-              ws,
-              streamSid,
-              'Hello. This is Lauren with Northline. I can hear you.',
-              'lauren-greeting'
-            );
-          } catch (err) {
-            console.error(
-              'TTS send failed:',
-              err?.response?.status,
-              err?.response?.data?.toString?.() || err.message
-            );
-          }
-        }
-      } else if (data.event === 'mark') {
-        console.log('Playback finished:', data.mark?.name);
-      } else if (data.event === 'media') {
-        // Caller audio arrives here
-      } else if (data.event === 'stop') {
-        console.log('Stream stopped');
-      }
     } catch (err) {
-      console.error('WS parse error:', err);
+      console.error('ERROR:', err.message);
     }
-  });
 
-  ws.on('close', () => {
-    console.log('Twilio media stream disconnected');
+    processing = false;
+
+  }, CHUNK_MS);
+
+  ws.on('message', (msg) => {
+    const data = JSON.parse(msg);
+
+    if (data.event === 'start') {
+      streamSid = data.start.streamSid;
+      console.log('Stream started');
+    }
+
+    if (data.event === 'media') {
+      buffer.push(Buffer.from(data.media.payload, 'base64'));
+    }
+
+    if (data.event === 'stop') {
+      console.log('Stream ended');
+    }
   });
 });
 
-const port = process.env.PORT || 10000;
-
-server.listen(port, '0.0.0.0', () => {
-  console.log(`voice-server listening on ${port}`);
+server.listen(process.env.PORT || 10000, () => {
+  console.log('Server running');
 });
