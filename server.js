@@ -3,19 +3,25 @@ const http = require('http');
 const WebSocket = require('ws');
 const axios = require('axios');
 
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED REJECTION:', err);
+});
+
+console.log('Booting voice-server...');
+
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
-const VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
+const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY || '';
+const VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '';
 
-if (!ELEVEN_API_KEY) {
-  console.warn('Missing ELEVENLABS_API_KEY');
-}
-if (!VOICE_ID) {
-  console.warn('Missing ELEVENLABS_VOICE_ID');
-}
+console.log('ELEVENLABS_API_KEY present:', !!ELEVEN_API_KEY);
+console.log('ELEVENLABS_VOICE_ID present:', !!VOICE_ID);
 
 app.get('/', (_req, res) => {
   res.status(200).send('voice-server alive');
@@ -37,7 +43,16 @@ app.post('/twiml', (_req, res) => {
 });
 
 async function elevenTtsToUlawBase64(text) {
+  if (!ELEVEN_API_KEY) {
+    throw new Error('Missing ELEVENLABS_API_KEY');
+  }
+  if (!VOICE_ID) {
+    throw new Error('Missing ELEVENLABS_VOICE_ID');
+  }
+
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}?output_format=ulaw_8000&optimize_streaming_latency=3`;
+
+  console.log('Calling ElevenLabs TTS...');
 
   const response = await axios.post(
     url,
@@ -61,6 +76,8 @@ async function elevenTtsToUlawBase64(text) {
       timeout: 30000
     }
   );
+
+  console.log('ElevenLabs TTS success, bytes:', response.data?.byteLength || 0);
 
   return Buffer.from(response.data).toString('base64');
 }
@@ -109,27 +126,36 @@ wss.on('connection', (ws) => {
             await speakOnCall(
               ws,
               streamSid,
-              "Hello. This is Lauren with Northline. I can hear you.",
-              "lauren-greeting"
+              'Hello. This is Lauren with Northline. I can hear you.',
+              'lauren-greeting'
             );
           } catch (err) {
-            console.error('TTS send failed:', err.response?.status || err.message);
+            console.error(
+              'TTS send failed:',
+              err?.response?.status,
+              err?.response?.data?.toString?.() || err.message
+            );
           }
         }
       } else if (data.event === 'mark') {
         console.log('Playback finished:', data.mark?.name);
       } else if (data.event === 'media') {
-        // Incoming caller audio arrives here.
-        // Next phase: buffer caller audio and turn it into transformed outbound audio.
+        // Caller audio arrives here
       } else if (data.event === 'stop') {
         console.log('Stream stopped');
       }
     } catch (err) {
-      console.error('WS parse error:', err.message);
+      console.error('WS parse error:', err);
     }
   });
 
   ws.on('close', () => {
     console.log('Twilio media stream disconnected');
   });
+});
+
+const port = process.env.PORT || 10000;
+
+server.listen(port, '0.0.0.0', () => {
+  console.log(`voice-server listening on ${port}`);
 });
