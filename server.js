@@ -8,7 +8,10 @@ const app = express();
 
 const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
 const VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
-const CHUNK_MS = 1500; // puedes bajar a 1200 luego
+
+const CHUNK_MS = 3000; // tamaño máximo chunk
+const SILENCE_THRESHOLD = 200;
+const SILENCE_MS = 400;
 
 app.get('/', (_req, res) => {
   res.send('voice-server live');
@@ -27,7 +30,7 @@ app.post('/twiml', (_req, res) => {
 `);
 });
 
-// ===== AUDIO HELPERS =====
+// ===== AUDIO =====
 function muLawDecode(byte) {
   byte = ~byte & 0xff;
   let sign = byte & 0x80;
@@ -66,7 +69,16 @@ function pcmToWav(pcm) {
   return Buffer.concat([header, pcm]);
 }
 
-// ===== ELEVENLABS =====
+function calcRMS(buffer) {
+  let sum = 0;
+  for (let i = 0; i < buffer.length; i++) {
+    const s = muLawDecode(buffer[i]);
+    sum += s * s;
+  }
+  return Math.sqrt(sum / (buffer.length || 1));
+}
+
+// ===== ELEVEN =====
 async function transformAudio(wavBuffer) {
   const form = new FormData();
 
@@ -84,7 +96,8 @@ async function transformAudio(wavBuffer) {
         'xi-api-key': ELEVEN_API_KEY,
         Accept: 'audio/basic'
       },
-      responseType: 'arraybuffer'
+      responseType: 'arraybuffer',
+      timeout: 30000
     }
   );
 
@@ -100,7 +113,10 @@ wss.on('connection', (ws) => {
   let buffer = [];
   let processing = false;
 
-  setInterval(async () => {
+  let lastVoice = 0;
+  let lastFlush = 0;
+
+  async function processNow() {
     if (!streamSid || processing || buffer.length === 0) return;
 
     processing = true;
@@ -121,14 +137,14 @@ wss.on('connection', (ws) => {
       }));
 
     } catch (err) {
-      console.error('ERROR:', err.message);
+      console.error('ERROR:', err.response?.status || err.message);
     }
 
     processing = false;
+    lastFlush = Date.now();
+  }
 
-  }, CHUNK_MS);
-
-  ws.on('message', (msg) => {
+  ws.on('message', async (msg) => {
     const data = JSON.parse(msg);
 
     if (data.event === 'start') {
@@ -137,13 +153,33 @@ wss.on('connection', (ws) => {
     }
 
     if (data.event === 'media') {
-      buffer.push(Buffer.from(data.media.payload, 'base64'));
+      const chunk = Buffer.from(data.media.payload, 'base64');
+      buffer.push(chunk);
+
+      const rms = calcRMS(chunk);
+      const now = Date.now();
+
+      if (rms > SILENCE_THRESHOLD) {
+        lastVoice = now;
+      }
+
+      if (lastVoice && (now - lastVoice > SILENCE_MS)) {
+        await processNow();
+      }
     }
 
     if (data.event === 'stop') {
       console.log('Stream ended');
+      await processNow();
     }
   });
+
+  // respaldo por si no detecta silencio
+  setInterval(async () => {
+    if (Date.now() - lastFlush > CHUNK_MS) {
+      await processNow();
+    }
+  }, 500);
 });
 
 server.listen(process.env.PORT || 10000, () => {
