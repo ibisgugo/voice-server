@@ -13,17 +13,18 @@ app.get('/', (_req, res) => {
 // Twilio will request this URL via HTTP and receive TwiML instructing it to open a bidirectional media stream.
 app.post('/twiml', (_req, res) => {
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || _req.get('host');
-  const wsUrl = `wss://${host}/media-stream`;
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Say>Connecting you now.</Say>
+  <Pause length="1"/>
   <Connect>
-    <Stream url="${wsUrl}" />
+    <Stream url="wss://${host}/media-stream" />
   </Connect>
 </Response>`;
 
   res.type('text/xml').send(twiml);
-});
+});;
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/media-stream' });
